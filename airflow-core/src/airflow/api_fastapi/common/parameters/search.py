@@ -55,7 +55,7 @@ class _PrefixPatternParam(BaseParam[str], ABC):
 
     @staticmethod
     def _prefix_lower_bound(term: str) -> str:
-        """Return the matching lower bound: strip trailing non-alphanumeric chars to pair with the upper."""
+        """Return the lower bound after stripping trailing non-alphanumeric characters."""
         while term and not term[-1].isalnum():
             term = term[:-1]
         return term
@@ -73,6 +73,7 @@ class _PrefixPatternParam(BaseParam[str], ABC):
         ``chata`` can sort after ``d`` under ``cs-CZ-x-icu``).
         """
         return [column >= lower, func.substr(column, 1, len(lower)) == lower]
+
     @abstractmethod
     def _prefix_clause(self, term: str):
         """Return the SQL boolean for one prefix term (including empty string after ``~`` alias)."""
@@ -193,7 +194,7 @@ class _TaskDisplayNamePrefixPatternParam(_PrefixPatternParam):
     Prefix filter equivalent to :attr:`TaskInstance.task_display_name`, rewritten for composite-index use.
 
     The hybrid expression ``coalesce(_task_display_property_value, task_id)`` cannot use those indexes;
-    this implementation applies an equivalent ``OR`` of simpler range predicates instead. Trailing
+    this implementation applies an equivalent ``OR`` of simpler lower-bound predicates instead. Trailing
     non-alphanumeric characters in ``term`` are stripped first (see :class:`_PrefixPatternParam`).
     """
 
