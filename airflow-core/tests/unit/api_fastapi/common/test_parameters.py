@@ -42,7 +42,6 @@ from airflow.api_fastapi.common.parameters.dag import _OwnersFilter
 from airflow.api_fastapi.common.parameters.range import NullableDatetimeRangeFilter
 from airflow.api_fastapi.common.parameters.search import (
     _escape_like_pattern,
-    _PrefixPatternParam,
     _TaskDisplayNamePrefixPatternParam,
     regex_param_factory,
 )
@@ -368,7 +367,7 @@ class TestNonSearchFilterEscaping:
 
 
 class TestPrefixSearchParam:
-    """Prefix search using range comparison (``attribute >= lower AND < upper``)."""
+    """Prefix search using a lower-bound comparison plus exact prefix equality."""
 
     def test_to_orm_single_value(self):
         param = _PrefixSearchParam(DagModel.dag_id).set_value("example_bash")
@@ -377,30 +376,21 @@ class TestPrefixSearchParam:
 
         sql = _compile(statement)
         assert "dag_id >= 'example_bash'" in sql
-        assert "dag_id < 'example_basi'" in sql
+        assert "dag_id <" not in sql
+        assert "substr(dag.dag_id, 1, 12) = 'example_bash'" in sql
 
-    def test_prefix_range_upper_boundary(self):
-        """Prefix range bumps the last alphanumeric character."""
-        assert _PrefixPatternParam._prefix_range_upper("xy") == "xz"
-        assert _PrefixPatternParam._prefix_range_upper("test_dag") == "test_dah"
-        assert _PrefixPatternParam._prefix_range_upper("") is None
+    def test_to_orm_does_not_derive_locale_unsafe_upper_bound(self):
+        """Contraction collations can sort a valid prefix match beyond a code-point bound."""
+        param = _PrefixSearchParam(DagModel.dag_id).set_value("c")
+        statement = param.to_orm(select(DagModel))
 
-    def test_prefix_range_upper_strips_trailing_punctuation(self):
-        """Trailing non-alphanumeric characters are dropped before bumping."""
-        assert _PrefixPatternParam._prefix_range_upper("test_") == "tesu"
-        assert _PrefixPatternParam._prefix_range_upper("s3://") == "s4"
-        assert _PrefixPatternParam._prefix_range_upper("bbc!!") == "bbd"
-        # All-punctuation → no usable range
-        assert _PrefixPatternParam._prefix_range_upper("///") is None
+        sql = _compile(statement)
+        assert "dag_id >= 'c'" in sql
+        assert "dag_id < 'd'" not in sql
+        assert "substr(dag.dag_id, 1, 1) = 'c'" in sql
 
-    def test_prefix_range_upper_cascades_past_non_alnum_bump(self):
-        """If bumping would produce a non-alphanumeric char, strip and retry."""
-        # 'z' → '{' (non-alphanumeric), so fall back to incrementing the previous char.
-        assert _PrefixPatternParam._prefix_range_upper("abz") == "ac"
-        # 'Z' → '[' (non-alphanumeric), so fall back.
-        assert _PrefixPatternParam._prefix_range_upper("abZ") == "ac"
-        # '9' → ':' (non-alphanumeric), so fall back.
-        assert _PrefixPatternParam._prefix_range_upper("a9") == "b"
+
+
 
     def test_to_orm_strips_trailing_underscore_prefix(self):
         """``'test_'`` is treated as the prefix ``'test'`` so the range is locale-safe."""
@@ -410,7 +400,8 @@ class TestPrefixSearchParam:
 
         sql = _compile(statement)
         assert "dag_id >= 'test'" in sql
-        assert "dag_id < 'tesu'" in sql
+        assert "dag_id <" not in sql
+        assert "substr(dag.dag_id, 1, 4) = 'test'" in sql
 
     def test_to_orm_empty_value_matches_all(self):
         """An empty value matches all non-null rows (used via the ``~`` alias)."""
@@ -476,15 +467,14 @@ class TestPrefixSearchParam:
         # Range scan uses the full composite-key value as the lower bound.
         assert "2026-01-01|us" in sql
 
-    def test_to_orm_narrows_the_range_with_a_leading_substring(self):
-        """The index-friendly bounds are wider than the prefix, so an equality pins the prefix down."""
+    def test_to_orm_uses_a_lower_bound_and_leading_substring(self):
+        """The lower bound remains index-friendly while equality pins down the prefix."""
         param = _PrefixSearchParam(DagModel.dag_id).set_value("dag_9")
         statement = param.to_orm(select(DagModel))
 
         sql = _compile(statement)
-        # '9' bumps to ':' (non-alphanumeric), so the upper bound comes from the shorter 'dag'.
         assert "dag_id >= 'dag_9'" in sql
-        assert "dag_id < 'dah'" in sql
+        assert "dag_id <" not in sql
         assert "substr(dag.dag_id, 1, 5) = 'dag_9'" in sql
 
     def test_to_orm_pipe_as_or_false_tilde_alias_still_works(self):
@@ -502,8 +492,8 @@ class TestPrefixSearchParamOnARealEngine:
     """
     Run the predicate against SQLite so the rows it lets through are checked, not just the SQL.
 
-    Every term below computes an upper bound wider than the term itself, so the bounds alone
-    would also return the rows that are missing from each ``expected`` list.
+    The lower bound keeps the scan index-friendly while the substring predicate enforces the
+    requested prefix under the database collation.
     """
 
     NAMES = [
@@ -541,12 +531,10 @@ class TestPrefixSearchParamOnARealEngine:
         [
             # 'dagz9' pins down that the user's '_' is literal, not a single-character wildcard.
             ("dag_9", ["dag_9", "dag_99"]),
-            # Differs from 'dagz9' only in case, which the bounds distinguish and so must the
-            # predicate narrowing them.
+            # Differs from 'dagz9' only in case, which the lower bound and equality distinguish.
             ("dagZ", ["dagZ1"]),
             ("a9", ["a9"]),
             ("abz", ["abz", "abz1"]),
-            # 'z' cascades down to no upper bound at all.
             ("z", ["z1", "zz"]),
             # Documented trade-off, unchanged: a trailing '_' is stripped, so 'dag_' means 'dag'.
             ("dag_", ["dagZ1", "dag_9", "dag_99", "dag_abc", "dagz9"]),
@@ -567,11 +555,11 @@ class TestTaskDisplayNamePrefixPatternParam:
         sql = _compile(statement)
         assert "task_display_name is null" in sql
         assert "task_id >=" in sql
-        assert "task_id <" in sql
+        assert "task_id <" not in sql
         assert "task_display_name is not null" in sql
 
-    def test_to_orm_narrows_both_branches_with_a_leading_substring(self):
-        """Both sides of the ``IS NULL`` split need the prefix predicate, not only the bounds."""
+    def test_to_orm_uses_a_lower_bound_and_leading_substring(self):
+        """Both sides of the ``IS NULL`` split need the prefix predicate."""
         param = _TaskDisplayNamePrefixPatternParam().set_value("task_9")
         statement = param.to_orm(select(TaskInstance))
 
